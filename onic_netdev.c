@@ -37,7 +37,8 @@
 #include "onic.h"
 
 #define ONIC_RX_DESC_STEP 256
-
+#define ONIC_RX_BUF_ORDER 2                 /* 4K << 2 = 16K */
+#define ONIC_RX_BUF_SIZE  (PAGE_SIZE << ONIC_RX_BUF_ORDER)
 inline static u16 onic_ring_get_real_count(struct onic_ring *ring)
 {
 	/* Valid writeback entry means one less count of descriptor entries */
@@ -420,12 +421,17 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		
 		int len = cmpl.pkt_len;
 
-		xdp_init_buff(&xdp, PAGE_SIZE, &q->xdp_rxq);
+		xdp_init_buff(&xdp, ONIC_RX_BUF_SIZE, &q->xdp_rxq);
+		//xdp_init_buff(&xdp, PAGE_SIZE, &q->xdp_rxq);
 
 		dma_sync_single_for_cpu(&priv->pdev->dev,
 					page_pool_get_dma_addr(buf->pg) +
 						buf->offset,
 						len, DMA_FROM_DEVICE);
+		//dma_sync_single_for_cpu(&priv->pdev->dev,
+		//			page_pool_get_dma_addr(buf->pg) +
+		//				buf->offset,
+		//				len, DMA_FROM_DEVICE);
    
 		xdp_prepare_buff(&xdp, page_address(buf->pg), buf->offset, len, false);
 		
@@ -441,7 +447,8 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 			if (xdp_res & ONIC_XDP_PASS) {
 				
 				// allocate a new skb structure around the data 
-				skb = napi_build_skb(xdp.data_hard_start, PAGE_SIZE);
+				skb = napi_build_skb(xdp.data_hard_start, ONIC_RX_BUF_SIZE);
+				//skb = napi_build_skb(xdp.data_hard_start, PAGE_SIZE);
 
 				if (!skb) {
 					rv = -ENOMEM;
@@ -749,7 +756,7 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 static int onic_create_page_pool(struct onic_private *priv, struct onic_rx_queue *q, int size) {
 	struct bpf_prog *xdp_prog = READ_ONCE(priv->xdp_prog);
 	struct page_pool_params pp_params = {
-		.order = 0,
+		.order = ONIC_RX_BUF_ORDER,
 		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
 		.pool_size = size,
 		.nid = dev_to_node(&priv->pdev->dev),
@@ -789,7 +796,7 @@ err_free_pp:
 static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 {
 	// TODO: make these configurable via ethtool
-	const u8 bufsz_idx = 8;
+	const u8 bufsz_idx = 15;
 	const u8 desc_rngcnt_idx = 8;
 	//const u8 cmpl_rngcnt_idx = 15;
 	const u8 cmpl_rngcnt_idx = 8;
@@ -1111,8 +1118,18 @@ int onic_do_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 
 int onic_change_mtu(struct net_device *dev, int mtu)
 {
-	netdev_info(dev, "Requested MTU = %d", mtu);
-	return 0;
+    netdev_info(dev, "Requested MTU = %d", mtu);
+
+    /* Basic sanity check: keep MTU in a reasonable range */
+    if (mtu < 68 || mtu > dev->max_mtu) {
+        netdev_err(dev,
+                   "MTU %d is out of range (min 68, max %d)\n",
+                   mtu, dev->max_mtu);
+        return -EINVAL;
+    }
+
+    dev->mtu = mtu;
+    return 0;
 }
 
 inline void onic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
