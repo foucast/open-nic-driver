@@ -1128,10 +1128,10 @@ int onic_change_mtu(struct net_device *dev, int mtu)
     netdev_info(dev, "Requested MTU = %d", mtu);
 
     /* Basic sanity check: keep MTU in a reasonable range */
-    if (mtu < 68 || mtu > dev->max_mtu) {
+    if (mtu < dev->min_mtu || mtu > dev->max_mtu) {
         netdev_err(dev,
-                   "MTU %d is out of range (min 68, max %d)\n",
-                   mtu, dev->max_mtu);
+                   "MTU %d is out of range (min %d, max %d)\n",
+                   mtu, dev->min_mtu, dev->max_mtu);
         return -EINVAL;
     }
 
