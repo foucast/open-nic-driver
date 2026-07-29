@@ -68,6 +68,33 @@ u16 onic_ring_count(u8 idx)
 }
 
 /**
+ * onic_c2h_bufsz_idx - find the c2h_bufsz_pool index whose table value
+ *                      equals @size
+ * @size: required C2H buffer size in bytes. In practice this is always
+ *        a page_pool-allocated power-of-two page count (4096, 8192, or
+ *        16384), since RX buffer order is derived from get_order().
+ * @idx: output -- matching index into c2h_bufsz_pool, valid only if 0
+ *       is returned
+ *
+ * Return 0 on success, -EINVAL if @size has no exact match in the table
+ * (e.g. it exceeds the largest entry, 16384 -- the hardware has no
+ * larger single C2H buffer size available).
+ **/
+int onic_c2h_bufsz_idx(u32 size, u8 *idx)
+{
+	int i;
+
+	for (i = 0; i < QDMA_NUM_C2H_BUFSZ; ++i) {
+		if (c2h_bufsz_pool[i] == size) {
+			*idx = i;
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+/**
  * onic_qdma_init_csr - initialize QDMA config/status registers
  * @qdev: pointer to QDMA device
  *

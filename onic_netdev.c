@@ -20,6 +20,8 @@
 #include <linux/pci.h>
 #include <linux/etherdevice.h>
 #include <linux/netdevice.h>
+#include <linux/skbuff.h>
+#include <linux/mm.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
 #include <linux/bpf_trace.h>
@@ -39,19 +41,43 @@
 #define ONIC_RX_DESC_STEP 256
 
 /*
- * Jumbo frame (9000 MTU) support: page_pool only allocates in
- * power-of-two page counts via `order`, so 12K (3 pages) isn't a
- * valid option -- the real choice is between order=1 (8K) and
- * order=2 (16K).
+ * RX buffer sizing is derived from the current MTU rather than
+ * hardcoded, so the driver isn't permanently tuned for jumbo frames
+ * at the expense of standard-MTU users. This mirrors the pattern
+ * used by e.g. ibmveth ("Automatically enable larger rx buffer pools
+ * for larger mtu") and the general approach in ixgbe/i40e/mlx5e:
+ * compute the buffer size needed for the configured MTU, and
+ * re-derive it (tearing down and rebuilding the RX queues) whenever
+ * MTU changes -- see onic_change_mtu().
  *
- * order=1 (8K) is not enough: a full 9000-byte MTU frame needs
- * ~9018B for payload + Ethernet header/FCS, plus XDP headroom in
- * front and skb_shared_info in the tail once napi_build_skb() wraps
- * the buffer -- comfortably over 8192B. order=2 (16K) is the
- * smallest power-of-two that clears this with margin.
+ * page_pool only allocates in power-of-two page counts via `order`,
+ * so an exact-fit buffer (e.g. 12K for a 9000 MTU) isn't an option --
+ * the required size gets rounded up to the next power-of-two page
+ * count via get_order().
+ *
+ * The hardware C2H buffer-size table (c2h_bufsz_pool in
+ * onic_hardware.c) only has exact entries at 4096/8192/16384 that
+ * line up with order 0/1/2 -- onic_c2h_bufsz_idx() finds the matching
+ * index, or fails if a larger order is ever needed than the hardware
+ * table supports (order 2 / 16384 is the current ceiling).
  */
-#define ONIC_RX_BUF_ORDER 2                 /* 4K << 2 = 16K */
-#define ONIC_RX_BUF_SIZE  (PAGE_SIZE << ONIC_RX_BUF_ORDER)
+
+/**
+ * onic_calc_rx_buf_size - bytes needed for one RX buffer at a given MTU
+ * @mtu: the MTU to size for
+ *
+ * Accounts for XDP headroom in front and skb_shared_info in the tail
+ * once napi_build_skb() wraps the buffer into an skb -- not just the
+ * raw payload size. Same shape of calculation used by e.g. mlx5e's
+ * mlx5e_rx_get_linear_frag_sz().
+ **/
+static unsigned int onic_calc_rx_buf_size(int mtu)
+{
+	unsigned int len = XDP_PACKET_HEADROOM + mtu + ETH_HLEN + ETH_FCS_LEN;
+
+	return SKB_DATA_ALIGN(len) +
+	       SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+}
 inline static u16 onic_ring_get_real_count(struct onic_ring *ring)
 {
 	/* Valid writeback entry means one less count of descriptor entries */
@@ -434,7 +460,7 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		
 		int len = cmpl.pkt_len;
 
-		xdp_init_buff(&xdp, ONIC_RX_BUF_SIZE, &q->xdp_rxq);
+		xdp_init_buff(&xdp, q->buf_size, &q->xdp_rxq);
 
 		dma_sync_single_for_cpu(&priv->pdev->dev,
 					page_pool_get_dma_addr(buf->pg) +
@@ -455,7 +481,7 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 			if (xdp_res & ONIC_XDP_PASS) {
 				
 				// allocate a new skb structure around the data 
-				skb = napi_build_skb(xdp.data_hard_start, ONIC_RX_BUF_SIZE);
+				skb = napi_build_skb(xdp.data_hard_start, q->buf_size);
 
 				if (!skb) {
 					rv = -ENOMEM;
@@ -760,10 +786,10 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 }
 
 
-static int onic_create_page_pool(struct onic_private *priv, struct onic_rx_queue *q, int size) {
+static int onic_create_page_pool(struct onic_private *priv, struct onic_rx_queue *q, int size, u8 order) {
 	struct bpf_prog *xdp_prog = READ_ONCE(priv->xdp_prog);
 	struct page_pool_params pp_params = {
-		.order = ONIC_RX_BUF_ORDER,
+		.order = order,
 		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
 		.pool_size = size,
 		.nid = dev_to_node(&priv->pdev->dev),
@@ -780,6 +806,7 @@ static int onic_create_page_pool(struct onic_private *priv, struct onic_rx_queue
 		q->page_pool = NULL;
 		return err;
 	}
+	q->buf_size = PAGE_SIZE << order;
 
 	err = xdp_rxq_info_reg(&q->xdp_rxq, priv->netdev, q->qid, 0);
 	if (err < 0)
@@ -797,13 +824,13 @@ err_unregister_rxq:
 err_free_pp:
 	page_pool_destroy(q->page_pool);
 	q->page_pool = NULL;
+	q->buf_size = 0;
 	return err;
 }
 
 static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 {
 	// TODO: make these configurable via ethtool
-	const u8 bufsz_idx = 15;
 	const u8 desc_rngcnt_idx = 8;
 	//const u8 cmpl_rngcnt_idx = 15;
 	const u8 cmpl_rngcnt_idx = 8;
@@ -811,10 +838,28 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	struct onic_rx_queue *q;
 	struct onic_ring *ring;
 	struct onic_qdma_c2h_param param;
+	unsigned int buf_size_needed;
+	u8 order, bufsz_idx;
 	u16 vid;
 	u32 size, real_count;
 	int i, rv;
 	bool debug = 0;
+
+	/*
+	 * Derive RX buffer order + hardware bufsz_idx from the current
+	 * MTU, rather than a fixed constant -- done before any allocation
+	 * so a failure here (order exceeds what the hardware table
+	 * supports) returns cleanly with nothing to unwind.
+	 */
+	buf_size_needed = onic_calc_rx_buf_size(dev->mtu);
+	order = get_order(buf_size_needed);
+	rv = onic_c2h_bufsz_idx(PAGE_SIZE << order, &bufsz_idx);
+	if (rv < 0) {
+		netdev_err(dev,
+			   "MTU %d needs RX buffer order %u (%lu bytes), which exceeds what the hardware C2H buffer-size table supports (max 16384)\n",
+			   dev->mtu, order, PAGE_SIZE << order);
+		return rv;
+	}
 
 	if (priv->rx_queue[qid]) {
 		if (debug)
@@ -862,7 +907,7 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 		goto clear_rx_queue;
 	}
 
-	rv = onic_create_page_pool(priv, q, real_count);
+	rv = onic_create_page_pool(priv, q, real_count, order);
 	if (rv < 0)
 		goto clear_rx_queue;
 	
@@ -1125,18 +1170,61 @@ int onic_do_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 
 int onic_change_mtu(struct net_device *dev, int mtu)
 {
-    netdev_info(dev, "Requested MTU = %d", mtu);
+	bool running = netif_running(dev);
+	int rv;
 
-    /* Basic sanity check: keep MTU in a reasonable range */
-    if (mtu < dev->min_mtu || mtu > dev->max_mtu) {
-        netdev_err(dev,
-                   "MTU %d is out of range (min %d, max %d)\n",
-                   mtu, dev->min_mtu, dev->max_mtu);
-        return -EINVAL;
-    }
+	netdev_info(dev, "Requested MTU = %d", mtu);
 
-    dev->mtu = mtu;
-    return 0;
+	/* Basic sanity check: keep MTU in a reasonable range */
+	if (mtu < dev->min_mtu || mtu > dev->max_mtu) {
+		netdev_err(dev,
+			   "MTU %d is out of range (min %d, max %d)\n",
+			   mtu, dev->min_mtu, dev->max_mtu);
+		return -EINVAL;
+	}
+
+	if (mtu == dev->mtu)
+		return 0;
+
+	/*
+	 * RX buffer size (and the matching hardware bufsz_idx) is derived
+	 * from MTU -- see onic_calc_rx_buf_size() / onic_init_rx_queue().
+	 * Buffers are pre-posted DMA memory the hardware writes into, so
+	 * they can't be resized in place while queues are live; the queues
+	 * have to be torn down and rebuilt against the new MTU. This
+	 * mirrors the pattern used by e.g. ibmveth when a MTU change
+	 * requires moving to a different buffer pool.
+	 *
+	 * TX needs no equivalent step: onic_xmit_frame() DMA-maps whatever
+	 * skb the stack already handed it (already sized to the current
+	 * MTU by the core networking layer) into a single H2C descriptor
+	 * whose length field is a full 16 bits (max 65535) -- comfortably
+	 * larger than any MTU this driver supports, so there's no
+	 * pre-allocated TX buffer pool to resize in the first place.
+	 */
+	if (running) {
+		rv = onic_stop_netdev(dev);
+		if (rv < 0) {
+			netdev_err(dev,
+				   "Failed to stop queues before MTU change, err = %d\n",
+				   rv);
+			return rv;
+		}
+	}
+
+	dev->mtu = mtu;
+
+	if (running) {
+		rv = onic_open_netdev(dev);
+		if (rv < 0) {
+			netdev_err(dev,
+				   "Failed to reopen queues after MTU change to %d, err = %d\n",
+				   mtu, rv);
+			return rv;
+		}
+	}
+
+	return 0;
 }
 
 inline void onic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)

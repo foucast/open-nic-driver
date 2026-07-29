@@ -105,6 +105,12 @@ struct onic_rx_queue {
 	struct bpf_prog *xdp_prog;
 	struct xdp_rxq_info xdp_rxq;
 	struct page_pool *page_pool;
+	unsigned int buf_size; /* actual RX buffer size in bytes for this
+				 * queue, set at init time from the current
+				 * MTU (see onic_calc_rx_buf_size()) -- read
+				 * by onic_rx_poll() per packet instead of a
+				 * fixed compile-time constant, since it can
+				 * change across an MTU-triggered re-init. */
 
 	struct {
 		u64 xdp_redirect;
