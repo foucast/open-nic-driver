@@ -37,6 +37,19 @@
 #include "onic.h"
 
 #define ONIC_RX_DESC_STEP 256
+
+/*
+ * Jumbo frame (9000 MTU) support: page_pool only allocates in
+ * power-of-two page counts via `order`, so 12K (3 pages) isn't a
+ * valid option -- the real choice is between order=1 (8K) and
+ * order=2 (16K).
+ *
+ * order=1 (8K) is not enough: a full 9000-byte MTU frame needs
+ * ~9018B for payload + Ethernet header/FCS, plus XDP headroom in
+ * front and skb_shared_info in the tail once napi_build_skb() wraps
+ * the buffer -- comfortably over 8192B. order=2 (16K) is the
+ * smallest power-of-two that clears this with margin.
+ */
 #define ONIC_RX_BUF_ORDER 2                 /* 4K << 2 = 16K */
 #define ONIC_RX_BUF_SIZE  (PAGE_SIZE << ONIC_RX_BUF_ORDER)
 inline static u16 onic_ring_get_real_count(struct onic_ring *ring)
