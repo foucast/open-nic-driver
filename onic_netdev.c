@@ -422,17 +422,12 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		int len = cmpl.pkt_len;
 
 		xdp_init_buff(&xdp, ONIC_RX_BUF_SIZE, &q->xdp_rxq);
-		//xdp_init_buff(&xdp, PAGE_SIZE, &q->xdp_rxq);
 
 		dma_sync_single_for_cpu(&priv->pdev->dev,
 					page_pool_get_dma_addr(buf->pg) +
 						buf->offset,
 						len, DMA_FROM_DEVICE);
-		//dma_sync_single_for_cpu(&priv->pdev->dev,
-		//			page_pool_get_dma_addr(buf->pg) +
-		//				buf->offset,
-		//				len, DMA_FROM_DEVICE);
-   
+
 		xdp_prepare_buff(&xdp, page_address(buf->pg), buf->offset, len, false);
 		
 		res = onic_run_xdp(q, &xdp,priv);
@@ -448,7 +443,6 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 				
 				// allocate a new skb structure around the data 
 				skb = napi_build_skb(xdp.data_hard_start, ONIC_RX_BUF_SIZE);
-				//skb = napi_build_skb(xdp.data_hard_start, PAGE_SIZE);
 
 				if (!skb) {
 					rv = -ENOMEM;
