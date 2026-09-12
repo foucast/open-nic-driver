@@ -56,6 +56,17 @@ struct onic_private;
 u16 onic_ring_count(u8 idx);
 
 /**
+ * onic_c2h_bufsz_idx - find the c2h_bufsz_pool index whose table value
+ *                      equals @size
+ * @size: required C2H buffer size in bytes (must be one of the exact
+ *        values present in the hardware table, e.g. 4096/8192/16384)
+ * @idx: output -- matching index, valid only if 0 is returned
+ *
+ * Return 0 on success, -EINVAL if @size has no match in the table.
+ **/
+int onic_c2h_bufsz_idx(u32 size, u8 *idx);
+
+/**
  * onic_init_hardware - initialize NIC hardware
  * @priv: pointer to driver private data
  *
