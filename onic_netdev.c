@@ -41,6 +41,21 @@
 #define ONIC_RX_DESC_STEP 256
 
 /*
+ * RX copybreak, as in e1000e: a received frame of at most this many bytes
+ * is copied into a small, newly allocated skb, and its RX buffer stays in
+ * the ring for the hardware to fill again. Without it every frame, however
+ * small, is handed up inside its whole RX buffer (16 KB at a 9000 MTU, see
+ * onic_calc_rx_buf_size()), which is what it then costs against a socket's
+ * receive buffer: a 55-byte UDP datagram charges 16,640 bytes of truesize.
+ * 0 turns it off.
+ */
+#define ONIC_COPYBREAK_DEFAULT 256
+static unsigned int copybreak __read_mostly = ONIC_COPYBREAK_DEFAULT;
+module_param(copybreak, uint, 0644);
+MODULE_PARM_DESC(copybreak,
+		 "Maximum size of packet that is copied to a new buffer on receive (0 = off)");
+
+/*
  * RX buffer sizing is derived from the current MTU rather than
  * hardcoded, so the driver isn't permanently tuned for jumbo frames
  * at the expense of standard-MTU users. This mirrors the pattern
@@ -177,6 +192,18 @@ static void onic_rx_refill(struct onic_rx_queue *q)
 
 	onic_set_rx_head(priv->hw.qdma, q->qid, ring->next_to_use);
 
+}
+
+/* Post the slot's current RX buffer to the hardware again (copybreak). */
+static void onic_rx_page_repost(struct onic_rx_queue *q)
+{
+	struct onic_ring *desc_ring = &q->desc_ring;
+	struct onic_rx_buffer *buf = &q->buffer[desc_ring->next_to_clean];
+	struct qdma_c2h_st_desc desc;
+	u8 *desc_ptr = desc_ring->desc + QDMA_C2H_ST_DESC_SIZE * desc_ring->next_to_clean;
+
+	desc.dst_addr = page_pool_get_dma_addr(buf->pg) + buf->offset;
+	qdma_pack_c2h_st_desc(desc_ptr, &desc);
 }
 
 static void onic_rx_page_refill(struct onic_rx_queue *q)
@@ -457,6 +484,7 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		struct onic_rx_buffer *buf =
 			&q->buffer[desc_ring->next_to_clean];
 		struct sk_buff *skb;
+		bool reuse = false;
 		
 		int len = cmpl.pkt_len;
 
@@ -479,21 +507,39 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 
 			// Allocate skb only if we are continuing to process the packet
 			if (xdp_res & ONIC_XDP_PASS) {
-				
-				// allocate a new skb structure around the data 
-				skb = napi_build_skb(xdp.data_hard_start, q->buf_size);
+				unsigned int pkt_len = xdp.data_end - xdp.data;
+
+				skb = NULL;
+				if (pkt_len <= READ_ONCE(copybreak)) {
+					// copybreak: copy a small frame into a small skb
+					// and give the RX buffer back to the hardware
+					skb = napi_alloc_skb(napi, pkt_len);
+					if (skb) {
+						skb_put_data(skb, xdp.data, pkt_len);
+						dma_sync_single_for_device(&priv->pdev->dev,
+									   page_pool_get_dma_addr(buf->pg) +
+										   buf->offset,
+									   len, DMA_FROM_DEVICE);
+						reuse = true;
+					}
+				}
 
 				if (!skb) {
-					rv = -ENOMEM;
-					break;
+					// allocate a new skb structure around the data
+					skb = napi_build_skb(xdp.data_hard_start, q->buf_size);
+
+					if (!skb) {
+						rv = -ENOMEM;
+						break;
+					}
+
+					// mark the skb for page_pool recycling
+					skb_mark_for_recycle(skb);
+					// reserve space in the skb for the data for the xdp headroom
+					skb_reserve(skb, xdp.data - xdp.data_hard_start);
+					// set the data pointer
+					skb_put(skb, pkt_len);
 				}
-				
-				// mark the skb for page_pool recycling
-				skb_mark_for_recycle(skb);
-				// reserve space in the skb for the data for the xdp headroom
-				skb_reserve(skb, xdp.data - xdp.data_hard_start);
-				// set the data pointer
-				skb_put(skb, xdp.data_end - xdp.data);
 
 				skb->protocol = eth_type_trans(skb, q->netdev);
 				skb->ip_summed = CHECKSUM_NONE;
@@ -507,8 +553,12 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		}
 
 
-		// here the page where packet data was written has either been recycled or marked for recycling
-		onic_rx_page_refill(q);
+		// here the page where packet data was written has either been recycled or marked for recycling,
+		// or (copybreak) is still this slot's and is posted to the hardware again as it is
+		if (reuse)
+			onic_rx_page_repost(q);
+		else
+			onic_rx_page_refill(q);
 
 		pcpu_stats_pointer->rx_packets++;
 		pcpu_stats_pointer->rx_bytes += len;
