@@ -177,7 +177,7 @@ do_load() {
 		addrs=$(awk '$1 == "addr" {sub(/\/.*/, "", $4); print $4}' "$state")
 		users=
 		for a in $addrs; do
-			users+=$(ss -Hanp | awk -v a="$a" 'index($5, a ":") == 1 || index($5, "[" a "]:") == 1')$'\n'
+			users+=$(ss -Hanp 2>/dev/null | awk -v a="$a" 'index($5, a ":") == 1 || index($5, "[" a "]:") == 1')$'\n'
 		done
 		if [ -n "${users//[$'\n']/}" ] && [ $force = 0 ]; then
 			log "sockets bound to an onic address; not reloading (use -f to override):"
