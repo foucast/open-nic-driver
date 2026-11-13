@@ -2,19 +2,25 @@
 # onic-load.sh: the one way to (re)load the onic driver on a host.
 #
 # Usage:
-#   onic-load.sh [-m MODULE.ko] [-r ROLLBACK.ko] [-s STATE] [-f] load
+#   onic-load.sh [-m MODULE.ko] [-r ROLLBACK.ko] [-s STATE] [-P PARAMS_FILE] [-f] load
 #   onic-load.sh [-s STATE] save
 #   onic-load.sh [-s STATE] restore
 #   onic-load.sh show
 #
 # load:    records each onic port's settings (save), removes the loaded onic module, inserts
-#          MODULE with RS_FEC_ENABLED=0 copybreak=1500 (override with ONIC_PARAMS), then puts the
-#          recorded settings back (restore) and waits for carrier on the ports that had it.
+#          MODULE with RS_FEC_ENABLED=0 copybreak=1500, then puts the recorded settings back
+#          (restore) and waits for carrier on the ports that had it. The parameters come from
+#          ONIC_PARAMS if set, else from PARAMS_FILE if it exists (one line; # comments).
+#          With no OpenNIC device on the host (a Xilinx function with an ID in ONIC_PCI_IDS,
+#          default 903f, and network class; an XDMA shell is 5000), load says so and exits 0
+#          without touching anything, so the same boot service is harmless on every host.
 #          The driver picks random MAC addresses at load, so without the restore every port
 #          would come back with a new MAC and no addresses.
 #          With -r, if a port that had carrier does not get it back within 30 s, ROLLBACK is
 #          loaded instead (with ONIC_ROLLBACK_PARAMS, default RS_FEC_ENABLED=0), the settings
 #          are restored again, and the script exits 1.
+#          Test only: ONIC_LOAD_TEST_FAIL_CARRIER=1 makes the first carrier check after the insert
+#          report failure at once (the ports are restored and up), to exercise the -r path.
 # save:    writes the settings of every onic port to STATE: MAC, MTU, up/down, global addresses,
 #          routes in any table except local (proto kernel routes excluded: they come back with
 #          the address), and permanent neighbour entries.
@@ -31,15 +37,16 @@ module=$here/../onic.ko
 rollback=
 state=/run/onic-load.state
 force=0
-params=${ONIC_PARAMS:-RS_FEC_ENABLED=0 copybreak=1500}
+params_file=
 rollback_params=${ONIC_ROLLBACK_PARAMS:-RS_FEC_ENABLED=0}
 
 usage() { sed -n '3,7p' "$0" | sed 's/^# //' >&2; exit 2; }
-while getopts "m:r:s:f" o; do
+while getopts "m:r:s:P:f" o; do
 	case $o in
 	m) module=$OPTARG ;;
 	r) rollback=$OPTARG ;;
 	s) state=$OPTARG ;;
+	P) params_file=$OPTARG ;;
 	f) force=1 ;;
 	*) usage ;;
 	esac
@@ -47,8 +54,28 @@ done
 shift $((OPTIND - 1))
 [ $# = 1 ] || usage
 cmd=$1
+if [ -n "${ONIC_PARAMS:-}" ]; then
+	params=$ONIC_PARAMS
+elif [ -n "$params_file" ] && [ -r "$params_file" ]; then
+	params=$(sed 's/#.*//' "$params_file" | tr -s ' \n\t' ' ' | sed 's/^ //; s/ $//')
+fi
+params=${params:-RS_FEC_ENABLED=0 copybreak=1500}
 
 log() { echo "onic-load: $*" >&2; logger -t onic-load -- "$*" 2>/dev/null || true; }
+
+# true if a PCI function carries the OpenNIC shell: Xilinx, an ID in ONIC_PCI_IDS, network class
+# (the SmartSSD's PCI bridge is also 10ee:913f, so the ID alone is not enough)
+opennic_present() {
+	local d id
+	for d in /sys/bus/pci/devices/*; do
+		[ "$(cat "$d/vendor")" = 0x10ee ] || continue
+		case $(cat "$d/class") in 0x02*) ;; *) continue ;; esac
+		for id in ${ONIC_PCI_IDS:-903f}; do
+			[ "$(cat "$d/device")" = "0x$id" ] && return 0
+		done
+	done
+	return 1
+}
 
 # onic ports as "name pci" lines
 ports() {
@@ -168,8 +195,21 @@ insert() {
 	insmod "$1" $2 && echo "$(cat /sys/module/onic/srcversion) $(readlink -f "$1")" > /run/onic-load.module
 }
 
+# the carrier check after the insert, with the test-only fault
+carrier_back() {
+	if [ "${ONIC_LOAD_TEST_FAIL_CARRIER:-0}" = 1 ]; then
+		log "TEST (ONIC_LOAD_TEST_FAIL_CARRIER=1): reporting that carrier did not return"
+		return 1
+	fi
+	wait_carrier 30
+}
+
 do_load() {
 	local addrs users t0 t1
+	if ! opennic_present; then
+		log "no OpenNIC device (10ee:${ONIC_PCI_IDS:-903f}, network class) on this host; nothing to load"
+		exit 0
+	fi
 	[ -r "$module" ] || { log "no module $module"; exit 1; }
 	[ -z "$rollback" ] || [ -r "$rollback" ] || { log "no rollback module $rollback"; exit 1; }
 	if [ -d /sys/module/onic ]; then
@@ -192,7 +232,7 @@ do_load() {
 		t0=$(date +%s.%N)
 	fi
 	log "inserting $module $params"
-	if insert "$module" "$params" && { [ ! -r "$state" ] || { do_restore && wait_carrier 30; }; }; then
+	if insert "$module" "$params" && { [ ! -r "$state" ] || { do_restore && carrier_back; }; }; then
 		t1=$(date +%s.%N)
 		log "loaded srcversion $(cat /sys/module/onic/srcversion); ports back after $(awk "BEGIN {printf \"%.1f\", $t1 - $t0}") s"
 		do_show

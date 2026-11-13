@@ -1,0 +1,19 @@
+# onic-load.service: load onic at boot on hosts whose U200 carries the OpenNIC shell, and put
+# the ports' MACs, MTUs, addresses, routes and neighbour pins back from /etc/onic/ports.state.
+# On a host without an OpenNIC device, onic-load.sh says so and exits 0: nothing is loaded.
+# Installed by scripts/onic-install.sh. Parameters: /etc/onic/params (one line), else
+# RS_FEC_ENABLED=0 copybreak=1500. Port state: onic-load.sh -s /etc/onic/ports.state save.
+[Unit]
+Description=Load the onic driver (OpenNIC shell) and restore its ports
+Wants=network-pre.target
+After=network-pre.target systemd-modules-load.service
+Before=network.target
+ConditionPathExists=/root/onic/onic.ko
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/root/onic/scripts/onic-load.sh -s /etc/onic/ports.state -P /etc/onic/params load
+
+[Install]
+WantedBy=multi-user.target

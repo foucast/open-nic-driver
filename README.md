@@ -20,14 +20,27 @@ Follow the steps below to build the driver.
 2. Connect 100Gbps cables/loopback adapters to enabled ports before insert the
    kernel module.  Currently, the driver does not detect link status change.
    Thus links should be ready before loading the driver.
-3. Run `sudo scripts/onic-load.sh load` to insert the kernel module. It loads
-   `onic.ko` with `RS_FEC_ENABLED=0 copybreak=1500` (override with
-   `ONIC_PARAMS`), and when onic is already loaded it records each port's MAC,
-   MTU, addresses, routes and permanent neighbours first and puts them back
-   after the reload: the driver picks random MAC addresses at load. `-r
-   ROLLBACK.ko` loads ROLLBACK instead if a port does not get its carrier back;
-   `scripts/onic-load.sh show` prints the loaded module and the ports. See the
-   comment at the top of the script.
+3. Install and load it with the scripts, which is the one way to do it on a
+   host:
+   - `sudo scripts/onic-install.sh` copies `onic.ko`, the scripts and a
+     `VERSION` file (commit, srcversion, sha256) into `/root/onic`, writes
+     `/etc/onic/params` (`RS_FEC_ENABLED=0 copybreak=1500`) if it does not
+     exist, and installs and enables `onic-load.service`. The module stays in
+     `/root/onic`, not `/lib/modules`, so udev never loads it with the source
+     defaults. Install it the same way on every host; on a host whose card
+     does not carry the OpenNIC shell, the service finds no OpenNIC device
+     and loads nothing.
+   - Once the ports are configured, record them for boot:
+     `sudo /root/onic/scripts/onic-load.sh -s /etc/onic/ports.state save`.
+   - `sudo systemctl start onic-load.service` (and every boot) runs
+     `onic-load.sh -s /etc/onic/ports.state -P /etc/onic/params load`. It
+     loads the module and puts each port's MAC, MTU, addresses, routes and
+     permanent neighbours back, because the driver picks random MAC addresses
+     at load. When onic is already loaded, it saves the ports' settings first
+     and reloads.
+   - `-r ROLLBACK.ko` loads ROLLBACK instead if a port does not get its carrier
+     back. `scripts/onic-load.sh show` prints the loaded module and the ports.
+     See the comments at the top of the scripts.
    Parameters: `RS_FEC_ENABLED` (0 or 1, default 1); `copybreak`, the largest
    received frame copied into a right-sized buffer instead of being passed up
    in its whole receive buffer (default 256, 0 = off, writable at runtime in
