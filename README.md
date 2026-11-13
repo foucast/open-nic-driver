@@ -38,6 +38,8 @@ Follow the steps below to build the driver.
      permanent neighbours back, because the driver picks random MAC addresses
      at load. When onic is already loaded, it saves the ports' settings first
      and reloads.
+     The service stays active after it runs, so a second `start` does nothing:
+     use `sudo systemctl restart onic-load.service` to reload.
    - `-r ROLLBACK.ko` loads ROLLBACK instead if a port does not get its carrier
      back. `scripts/onic-load.sh show` prints the loaded module and the ports.
      See the comments at the top of the scripts.
