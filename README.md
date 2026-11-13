@@ -20,8 +20,18 @@ Follow the steps below to build the driver.
 2. Connect 100Gbps cables/loopback adapters to enabled ports before insert the
    kernel module.  Currently, the driver does not detect link status change.
    Thus links should be ready before loading the driver.
-3. Run `sudo insmod onic.ko` to insert the kernel module. (There is an optional 
-   parameter RS_FEC_ENABLED, which can be set to either zero or one.)
+3. Run `sudo scripts/onic-load.sh load` to insert the kernel module. It loads
+   `onic.ko` with `RS_FEC_ENABLED=0 copybreak=1500` (override with
+   `ONIC_PARAMS`), and when onic is already loaded it records each port's MAC,
+   MTU, addresses, routes and permanent neighbours first and puts them back
+   after the reload: the driver picks random MAC addresses at load. `-r
+   ROLLBACK.ko` loads ROLLBACK instead if a port does not get its carrier back;
+   `scripts/onic-load.sh show` prints the loaded module and the ports. See the
+   comment at the top of the script.
+   Parameters: `RS_FEC_ENABLED` (0 or 1, default 1); `copybreak`, the largest
+   received frame copied into a right-sized buffer instead of being passed up
+   in its whole receive buffer (default 256, 0 = off, writable at runtime in
+   `/sys/module/onic/parameters/copybreak`).
 5. Verify that no error message is printed through `dmesg`, and new devices show
    up in `ifconfig` output.
 
